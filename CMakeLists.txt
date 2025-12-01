@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# © scalable_echo_server_demo Contributors. All rights reserved.
+
 cmake_minimum_required(VERSION 3.20)
 
 project(scalable_echo_server_demo LANGUAGES CXX)
@@ -5,6 +8,25 @@ project(scalable_echo_server_demo LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Install developer convenience scripts (pre-commit hook) only for the top-level project
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+  include(cmake/format.cmake OPTIONAL)
+endif()
+
+# Prefer to use FetchContent to bring in Microsoft WIL (Windows Implementation Libraries)
+include(FetchContent)
+
+FetchContent_Declare(
+    wil
+    GIT_REPOSITORY https://github.com/microsoft/wil.git
+    GIT_TAG        v1.0.250325.1  # pinned tag — adjust as needed
+)
+
+set(WIL_BUILD_TESTS OFF CACHE BOOL "Disable WIL tests")
+set(WIL_BUILD_DOCS OFF CACHE BOOL "Disable WIL docs")
+
+FetchContent_MakeAvailable(wil)
 
 # Server executable
 add_executable(echo_server
@@ -14,6 +36,7 @@ add_executable(echo_server
 
 target_include_directories(echo_server PRIVATE
     ${CMAKE_SOURCE_DIR}/src
+    ${wil_SOURCE_DIR}/include
 )
 
 # Client executable
@@ -24,6 +47,7 @@ add_executable(echo_client
 
 target_include_directories(echo_client PRIVATE
     ${CMAKE_SOURCE_DIR}/src
+    ${wil_SOURCE_DIR}/include
 )
 
 # Windows-specific libraries

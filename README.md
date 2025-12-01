@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: MIT
+  Copyright (c) 2025 scalable_echo_server_demo contributors -->
+
 # Scalable Echo Server Demo
 
 A high-performance UDP echo server and client implementation for Windows that demonstrates scalable network I/O using:
@@ -6,8 +9,7 @@ A high-performance UDP echo server and client implementation for Windows that de
 - **IO Completion Ports (IOCP)** - Windows high-performance asynchronous I/O
 - **Thread CPU affinity** - Worker threads pinned to specific CPU cores
 - **One socket per CPU core** - Maximum parallelism with minimal lock contention
- - **One socket per CPU core (server)** - Server still uses one socket per core
- - **Multiple client sockets per worker (client)** - Client can open multiple sockets per worker, each bound to a unique ephemeral port to increase 5-tuple entropy
+- **Multiple client sockets per worker (client)** - Client can open multiple sockets per worker, each bound to a unique ephemeral port to increase 5-tuple entropy
 
 ## Requirements
 
