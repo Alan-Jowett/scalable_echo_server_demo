@@ -106,15 +106,18 @@ void worker_thread_func(worker_context* ctx, size_t payload_size) {
 
     std::osyncstream(std::cout) << std::format("[CPU {}] Worker started\n", ctx->processor_id);
 
-    // Rate limiting: schedule sends evenly over each second
-    auto next_send_time = std::chrono::steady_clock::now();
+    // Rate limiting: maintain a quota = elapsed_time * g_rate_limit
+    auto start_time = std::chrono::steady_clock::now();
     const uint64_t ns_per_packet = g_rate_limit > 0 ? 1000000000ULL / g_rate_limit : 0;
 
     while (!g_shutdown.load()) {
-        // Try to send new packets (paced evenly)
+        // Try to send new packets up to quota (quota = elapsed_seconds * g_rate_limit)
         auto now = std::chrono::steady_clock::now();
+        double elapsed_s = std::chrono::duration_cast<std::chrono::duration<double>>(now - start_time).count();
+        uint64_t allowed = g_rate_limit == 0 ? UINT64_MAX : static_cast<uint64_t>(elapsed_s * static_cast<double>(g_rate_limit));
 
-        if (!available_send_contexts.empty() && (g_rate_limit == 0 || now >= next_send_time)) {
+        uint64_t sent_so_far = ctx->packets_sent.load();
+        while (!available_send_contexts.empty() && (g_rate_limit == 0 || sent_so_far < allowed)) {
             auto* send_ctx = available_send_contexts.back();
             available_send_contexts.pop_back();
 
@@ -131,14 +134,17 @@ void worker_thread_func(worker_context* ctx, size_t payload_size) {
                          reinterpret_cast<sockaddr*>(&ctx->server_addr), ctx->server_addr_len)) {
                 ctx->packets_sent.fetch_add(1);
                 ctx->bytes_sent.fetch_add(total_size);
-                if (g_rate_limit > 0) {
-                    next_send_time += std::chrono::nanoseconds(ns_per_packet);
-                    // avoid falling behind indefinitely
-                    if (next_send_time < now) next_send_time = now;
-                }
+                sent_so_far++;
             } else {
                 ctx->outstanding_sequences.erase(header->sequence_number);
                 available_send_contexts.push_back(send_ctx);
+                break; // stop trying if send failed
+            }
+            // recompute allowed in case g_rate_limit changed dynamically
+            if (g_rate_limit != 0) {
+                now = std::chrono::steady_clock::now();
+                elapsed_s = std::chrono::duration_cast<std::chrono::duration<double>>(now - start_time).count();
+                allowed = static_cast<uint64_t>(elapsed_s * static_cast<double>(g_rate_limit));
             }
         }
 
