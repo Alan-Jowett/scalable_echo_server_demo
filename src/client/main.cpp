@@ -30,7 +30,7 @@ void signal_handler(int) {
 // Worker context for each CPU/socket pair
 struct worker_context {
     uint32_t processor_id;
-    SOCKET socket;
+    std::vector<SOCKET> sockets;
     HANDLE iocp;
     std::thread worker_thread;
     std::atomic<uint64_t> next_sequence{0};
@@ -50,6 +50,7 @@ struct worker_context {
     int server_addr_len;
     // Per-worker packet rate assigned from the global total (packets/sec)
     uint64_t per_worker_rate{0};
+    std::atomic<size_t> next_socket_index{0};
 };
 
 // Packet rate limit total across all workers (packets per second, 0 = unlimited)
@@ -97,13 +98,18 @@ void worker_thread_func(worker_context* ctx, size_t payload_size) {
         available_send_contexts.push_back(contexts[i].get());
     }
 
-    // Post initial receive operations
-    while (!available_recv_contexts.empty()) {
-        auto* recv_ctx = available_recv_contexts.back();
-        available_recv_contexts.pop_back();
-        if (!post_recv(ctx->socket, recv_ctx)) {
-            available_recv_contexts.push_back(recv_ctx);
-            break;
+    // Post initial receive operations across this worker's sockets (round-robin)
+    if (!ctx->sockets.empty()) {
+        size_t sock_idx = 0;
+        while (!available_recv_contexts.empty()) {
+            auto* recv_ctx = available_recv_contexts.back();
+            available_recv_contexts.pop_back();
+            SOCKET s = ctx->sockets[sock_idx % ctx->sockets.size()];
+            if (!post_recv(s, recv_ctx)) {
+                available_recv_contexts.push_back(recv_ctx);
+                break;
+            }
+            ++sock_idx;
         }
     }
 
@@ -132,7 +138,16 @@ void worker_thread_func(worker_context* ctx, size_t payload_size) {
 
             ctx->outstanding_sequences.insert(header->sequence_number);
 
-            if (post_send(ctx->socket, send_ctx, send_ctx->buffer.data(), total_size,
+            // Round-robin pick a socket from this worker's sockets
+            SOCKET send_sock = ctx->sockets.empty() ? INVALID_SOCKET : ctx->sockets[ctx->next_socket_index.fetch_add(1) % ctx->sockets.size()];
+            if (send_sock == INVALID_SOCKET) {
+                // No socket available — push back and break
+                ctx->outstanding_sequences.erase(header->sequence_number);
+                available_send_contexts.push_back(send_ctx);
+                break;
+            }
+
+            if (post_send(send_sock, send_ctx, send_ctx->buffer.data(), total_size,
                          reinterpret_cast<sockaddr*>(&ctx->server_addr), ctx->server_addr_len)) {
                 ctx->packets_sent.fetch_add(1);
                 ctx->bytes_sent.fetch_add(total_size);
@@ -170,9 +185,10 @@ void worker_thread_func(worker_context* ctx, size_t payload_size) {
             }
             if (overlapped != nullptr) {
                 auto* io_ctx = static_cast<io_context*>(overlapped);
+                SOCKET s = static_cast<SOCKET>(completion_key);
                 if (io_ctx->operation == io_operation_type::recv) {
-                    // Re-post receive
-                    post_recv(ctx->socket, io_ctx);
+                    // Re-post receive on the socket that completed
+                    post_recv(s, io_ctx);
                 } else {
                     available_send_contexts.push_back(io_ctx);
                 }
@@ -202,8 +218,9 @@ void worker_thread_func(worker_context* ctx, size_t payload_size) {
                 ctx->outstanding_sequences.erase(header->sequence_number);
             }
 
-            // Re-post receive
-            post_recv(ctx->socket, io_ctx);
+            // Re-post receive on the socket that completed
+            SOCKET s = static_cast<SOCKET>(completion_key);
+            post_recv(s, io_ctx);
         } else {
             // Send completed
             available_send_contexts.push_back(io_ctx);
@@ -244,6 +261,7 @@ int main(int argc, char* argv[]) {
     parser.add_option("duration", 'd', "10", true);
     parser.add_option("rate", 'r', "10000", true);
     parser.add_option("recvbuf", 'b', "4194304", true);
+    parser.add_option("sockets", 'k', "1", true);
     parser.add_option("help", 'h', "0", false);
 
     parser.parse(argc, argv);
@@ -260,6 +278,7 @@ int main(int argc, char* argv[]) {
     const std::string duration_str = parser.get("duration");
     const std::string rate_str = parser.get("rate");
     const std::string recvbuf_str = parser.get("recvbuf");
+    const std::string sockets_str = parser.get("sockets");
 
     if (server_str.empty() || port_arg.empty()) {
         std::cerr << "Server and port are required\n";
@@ -292,6 +311,8 @@ int main(int argc, char* argv[]) {
     }
 
     g_rate_limit = static_cast<uint64_t>(std::atoi(rate_str.c_str()));
+    int sockets_per_worker = std::atoi(sockets_str.c_str());
+    if (sockets_per_worker <= 0) sockets_per_worker = 1;
 
     // Parse receive buffer size for sockets (default 4MB)
     int recvbuf = 4194304;
@@ -380,72 +401,87 @@ int main(int argc, char* argv[]) {
         std::memcpy(&ctx->server_addr, &server_addr_storage, static_cast<size_t>(server_addr_len));
         ctx->server_addr_len = server_addr_len;
 
-        // Create UDP socket with the resolved address family
-        ctx->socket = create_udp_socket(server_family);
-        if (ctx->socket == INVALID_SOCKET) {
-            std::cerr << std::format("Failed to create socket for CPU {}\n", i);
-            continue;
-        }
-
-        // Set socket CPU affinity
-        if (!set_socket_cpu_affinity(ctx->socket, static_cast<uint16_t>(i))) {
-            std::cerr << std::format("Warning: Could not set CPU affinity for socket on CPU {}\n", i);
-        }
-
-        // Increase socket buffer sizes to reduce drops
-        if (setsockopt(ctx->socket, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&recvbuf), sizeof(recvbuf)) != 0) {
-            std::cerr << std::format("Warning: Could not set SO_RCVBUF to {} on CPU {}: {}\n", recvbuf, i, get_last_error_message());
-        }
-        int sndbuf = recvbuf;
-        if (setsockopt(ctx->socket, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&sndbuf), sizeof(sndbuf)) != 0) {
-            std::cerr << std::format("Warning: Could not set SO_SNDBUF to {} on CPU {}: {}\n", sndbuf, i, get_last_error_message());
-        }
-
-        // Bind socket to any available port (match address family)
-        if (server_family == AF_INET6) {
-            sockaddr_in6 bind_addr6 = {};
-            bind_addr6.sin6_family = AF_INET6;
-            bind_addr6.sin6_port = 0; // Any port
-            bind_addr6.sin6_addr = in6addr_any;
-            bind_addr6.sin6_scope_id = 0;
-            if (bind(ctx->socket, reinterpret_cast<sockaddr*>(&bind_addr6), sizeof(bind_addr6)) == SOCKET_ERROR) {
-                std::cerr << std::format("Failed to bind IPv6 socket for CPU {}: {}\n", i, get_last_error_message());
-                closesocket(ctx->socket);
+        // Create multiple UDP sockets for this worker, each bound to its own ephemeral port
+        for (int sidx = 0; sidx < sockets_per_worker; ++sidx) {
+            SOCKET sock = create_udp_socket(server_family);
+            if (sock == INVALID_SOCKET) {
+                std::cerr << std::format("Failed to create socket for CPU {} (sock {})\n", i, sidx);
                 continue;
             }
-        } else {
-            sockaddr_in bind_addr = {};
-            bind_addr.sin_family = AF_INET;
-            bind_addr.sin_addr.s_addr = INADDR_ANY;
-            bind_addr.sin_port = 0;  // Any port
-            if (bind(ctx->socket, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) == SOCKET_ERROR) {
-                std::cerr << std::format("Failed to bind socket for CPU {}: {}\n", i, get_last_error_message());
-                closesocket(ctx->socket);
-                continue;
+
+            // Set socket CPU affinity
+            if (!set_socket_cpu_affinity(sock, static_cast<uint16_t>(i))) {
+                std::cerr << std::format("Warning: Could not set CPU affinity for socket on CPU {} (sock {})\n", i, sidx);
+            }
+
+            ctx->sockets.push_back(sock);
+        }
+
+        // Increase socket buffer sizes and bind each socket to an ephemeral port
+        for (size_t idx = 0; idx < ctx->sockets.size(); ++idx) {
+            SOCKET sock = ctx->sockets[idx];
+            if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&recvbuf), sizeof(recvbuf)) != 0) {
+                std::cerr << std::format("Warning: Could not set SO_RCVBUF to {} on CPU {} sock {}: {}\n", recvbuf, i, idx, get_last_error_message());
+            }
+            int sndbuf = recvbuf;
+            if (setsockopt(sock, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&sndbuf), sizeof(sndbuf)) != 0) {
+                std::cerr << std::format("Warning: Could not set SO_SNDBUF to {} on CPU {} sock {}: {}\n", sndbuf, i, idx, get_last_error_message());
+            }
+
+            // Bind to ephemeral port (port 0)
+            if (server_family == AF_INET6) {
+                sockaddr_in6 bind_addr6 = {};
+                bind_addr6.sin6_family = AF_INET6;
+                bind_addr6.sin6_port = 0; // Any port
+                bind_addr6.sin6_addr = in6addr_any;
+                bind_addr6.sin6_scope_id = 0;
+                if (bind(sock, reinterpret_cast<sockaddr*>(&bind_addr6), sizeof(bind_addr6)) == SOCKET_ERROR) {
+                    std::cerr << std::format("Failed to bind IPv6 socket for CPU {} sock {}: {}\n", i, idx, get_last_error_message());
+                    closesocket(sock);
+                    continue;
+                }
+            } else {
+                sockaddr_in bind_addr = {};
+                bind_addr.sin_family = AF_INET;
+                bind_addr.sin_addr.s_addr = INADDR_ANY;
+                bind_addr.sin_port = 0;  // Any port
+                if (bind(sock, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) == SOCKET_ERROR) {
+                    std::cerr << std::format("Failed to bind socket for CPU {} sock {}: {}\n", i, idx, get_last_error_message());
+                    closesocket(sock);
+                    continue;
+                }
             }
         }
 
-        // Determine local port assigned by the OS and log it
-        sockaddr_storage local_addr = {};
-        socklen_t local_len = static_cast<socklen_t>(sizeof(local_addr));
-        if (getsockname(ctx->socket, reinterpret_cast<sockaddr*>(&local_addr), &local_len) == 0) {
-            uint16_t local_port = 0;
-            if (local_addr.ss_family == AF_INET) {
-                local_port = ntohs(reinterpret_cast<sockaddr_in*>(&local_addr)->sin_port);
-            } else if (local_addr.ss_family == AF_INET6) {
-                local_port = ntohs(reinterpret_cast<sockaddr_in6*>(&local_addr)->sin6_port);
+        // Determine local ports assigned by the OS and log them
+        for (size_t idx = 0; idx < ctx->sockets.size(); ++idx) {
+            SOCKET sock = ctx->sockets[idx];
+            sockaddr_storage local_addr = {};
+            socklen_t local_len = static_cast<socklen_t>(sizeof(local_addr));
+            if (getsockname(sock, reinterpret_cast<sockaddr*>(&local_addr), &local_len) == 0) {
+                uint16_t local_port = 0;
+                if (local_addr.ss_family == AF_INET) {
+                    local_port = ntohs(reinterpret_cast<sockaddr_in*>(&local_addr)->sin_port);
+                } else if (local_addr.ss_family == AF_INET6) {
+                    local_port = ntohs(reinterpret_cast<sockaddr_in6*>(&local_addr)->sin6_port);
+                }
+                std::cout << std::format("Socket for CPU {} sock {} bound to local port {}\n", i, idx, local_port);
+            } else {
+                std::cerr << std::format("Could not get local port for CPU {} sock {}: {}\n", i, idx, get_last_error_message());
             }
-            std::cout << "Socket for CPU " << i << " bound to local port " << local_port << '\n';
-        } else {
-            std::cerr << "Could not get local port for CPU " << i << ": " << get_last_error_message() << '\n';
         }
 
-        // Create IOCP and associate socket
-        ctx->iocp = create_iocp_and_associate(ctx->socket);
+        // Create IOCP for the worker and associate each socket with it
+        ctx->iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1);
         if (ctx->iocp == nullptr) {
-            std::cerr << std::format("Failed to create IOCP for CPU {}\n", i);
-            closesocket(ctx->socket);
+            std::cerr << std::format("Failed to create IOCP for CPU {}: {}\n", i, get_last_error_message());
+            for (SOCKET s : ctx->sockets) closesocket(s);
             continue;
+        }
+        for (SOCKET s : ctx->sockets) {
+            if (!associate_socket_with_iocp(s, ctx->iocp, static_cast<ULONG_PTR>(s))) {
+                std::cerr << std::format("Failed to associate socket with IOCP for CPU {}: {}\n", i, get_last_error_message());
+            }
         }
 
         std::cout << std::format("Created socket and IOCP for CPU {}\n", i);
@@ -515,8 +551,8 @@ int main(int argc, char* argv[]) {
 
     // Close sockets
     for (auto& ctx : workers) {
-        if (ctx->socket != INVALID_SOCKET) {
-            closesocket(ctx->socket);
+        for (SOCKET s : ctx->sockets) {
+            if (s != INVALID_SOCKET) closesocket(s);
         }
     }
 
