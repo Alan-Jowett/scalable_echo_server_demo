@@ -48,10 +48,13 @@ struct worker_context {
     // Target server
     sockaddr_storage server_addr;
     int server_addr_len;
+    // Per-worker packet rate assigned from the global total (packets/sec)
+    uint64_t per_worker_rate{0};
 };
 
-// Packet rate limit per worker (packets per second, 0 = unlimited)
-uint64_t g_rate_limit = 10000; // default
+// Packet rate limit total across all workers (packets per second, 0 = unlimited)
+// Each worker will be assigned an equal share (plus remainder distribution).
+uint64_t g_rate_limit = 10000; // default total
 
 // Update min atomically
 void update_min(std::atomic<uint64_t>& target, uint64_t value) {
@@ -106,18 +109,17 @@ void worker_thread_func(worker_context* ctx, size_t payload_size) {
 
     std::osyncstream(std::cout) << std::format("[CPU {}] Worker started\n", ctx->processor_id);
 
-    // Rate limiting: maintain a quota = elapsed_time * g_rate_limit
+    // Rate limiting: each worker maintains a quota = elapsed_time * per_worker_rate
     auto start_time = std::chrono::steady_clock::now();
-    const uint64_t ns_per_packet = g_rate_limit > 0 ? 1000000000ULL / g_rate_limit : 0;
 
     while (!g_shutdown.load()) {
         // Try to send new packets up to quota (quota = elapsed_seconds * g_rate_limit)
         auto now = std::chrono::steady_clock::now();
         double elapsed_s = std::chrono::duration_cast<std::chrono::duration<double>>(now - start_time).count();
-        uint64_t allowed = g_rate_limit == 0 ? UINT64_MAX : static_cast<uint64_t>(elapsed_s * static_cast<double>(g_rate_limit));
+        uint64_t allowed = ctx->per_worker_rate == 0 ? UINT64_MAX : static_cast<uint64_t>(elapsed_s * static_cast<double>(ctx->per_worker_rate));
 
         uint64_t sent_so_far = ctx->packets_sent.load();
-        while (!available_send_contexts.empty() && (g_rate_limit == 0 || sent_so_far < allowed)) {
+        while (!available_send_contexts.empty() && (ctx->per_worker_rate == 0 || sent_so_far < allowed)) {
             auto* send_ctx = available_send_contexts.back();
             available_send_contexts.pop_back();
 
@@ -140,11 +142,11 @@ void worker_thread_func(worker_context* ctx, size_t payload_size) {
                 available_send_contexts.push_back(send_ctx);
                 break; // stop trying if send failed
             }
-            // recompute allowed in case g_rate_limit changed dynamically
-            if (g_rate_limit != 0) {
+            // recompute allowed in case per-worker rate changed dynamically
+            if (ctx->per_worker_rate != 0) {
                 now = std::chrono::steady_clock::now();
                 elapsed_s = std::chrono::duration_cast<std::chrono::duration<double>>(now - start_time).count();
-                allowed = static_cast<uint64_t>(elapsed_s * static_cast<double>(g_rate_limit));
+                allowed = static_cast<uint64_t>(elapsed_s * static_cast<double>(ctx->per_worker_rate));
             }
         }
 
@@ -227,7 +229,7 @@ void print_usage(const char* program_name) {
               << "  --payload, -l <bytes>     - Payload size in bytes (default: 64)\n"
               << "  --cores, -c <n>           - Number of cores/workers to use (default: all)\n"
               << "  --duration, -d <seconds>  - Test duration in seconds (default: 10)\n"
-              << "  --rate, -r <pps>          - Packets per second per worker (0 = unlimited)\n"
+              << "  --rate, -r <pps>          - Packets per second total across all workers (0 = unlimited)\n"
               << "  --recvbuf, -b <bytes>     - Socket receive buffer size in bytes (default: 4194304 = 4MB)\n"
               << "  --help, -h                - Show this help\n";
 }
@@ -304,7 +306,8 @@ int main(int argc, char* argv[]) {
     std::cout << std::format("Available processors: {}\n", num_processors);
     std::cout << std::format("Using {} worker(s)\n", num_workers);
     std::cout << std::format("Duration: {} seconds\n", duration_sec);
-    std::cout << std::format("Rate limit: {} packets/sec per worker\n", g_rate_limit);
+    uint64_t per_worker_display = g_rate_limit == 0 ? 0 : (g_rate_limit / num_workers);
+    std::cout << std::format("Rate limit: {} packets/sec total ({} per worker)\n", g_rate_limit, per_worker_display);
 
     // Initialize Winsock
     if (!initialize_winsock()) {
@@ -453,6 +456,17 @@ int main(int argc, char* argv[]) {
         std::cerr << "Failed to create any workers\n";
         cleanup_winsock();
         return 1;
+    }
+
+    // Compute per-worker rate: divide global total equally among workers
+    uint64_t per_worker_rate = 0;
+    if (g_rate_limit == 0) {
+        per_worker_rate = 0; // 0 == unlimited
+    } else {
+        per_worker_rate = g_rate_limit / static_cast<uint64_t>(workers.size());
+    }
+    for (auto& ctx : workers) {
+        ctx->per_worker_rate = per_worker_rate;
     }
 
     // Start worker threads
