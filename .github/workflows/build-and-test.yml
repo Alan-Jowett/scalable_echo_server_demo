@@ -23,15 +23,15 @@ jobs:
     - name: Run loopback test
       shell: pwsh
       run: |
-        # Start the server in background on port 5000
-        $server = Start-Process -FilePath ".\build\Release\echo_server.exe" -ArgumentList "5000", "1" -PassThru -NoNewWindow
+        # Start the server in background on port 5000 (use explicit flags)
+        $server = Start-Process -FilePath ".\build\Release\echo_server.exe" -ArgumentList "--port", "5000", "--cores", "1" -PassThru -NoNewWindow
         
         # Wait for server to start
         Start-Sleep -Seconds 2
         
         try {
-          # Run client test for 5 seconds with 1 worker
-          $clientOutput = & ".\build\Release\echo_client.exe" "127.0.0.1" "5000" "64" "1" "5" 2>&1
+          # Run client test for 5 seconds with 1 worker (use new flag-style CLI)
+          $clientOutput = & ".\build\Release\echo_client.exe" "127.0.0.1" "5000" "--payload" "64" "--cores" "1" "--duration" "5" 2>&1
           $clientExitCode = $LASTEXITCODE
           
           Write-Host "Client output:"
