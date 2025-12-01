@@ -17,6 +17,8 @@
 
 // Global flag for shutdown
 std::atomic<bool> g_shutdown{false};
+// Global verbose flag
+std::atomic<bool> g_verbose{false};
 
 // Signal handler
 void signal_handler(int) {
@@ -41,7 +43,7 @@ void worker_thread_func(worker_context* ctx) {
     if (!set_thread_affinity(ctx->processor_id)) {
         std::osyncstream(std::cerr) << std::format("[CPU {}] Failed to set thread affinity\n", ctx->processor_id);
     } else {
-        std::osyncstream(std::cout) << std::format("[CPU {}] Thread affinity set successfully\n", ctx->processor_id);
+        if (g_verbose.load()) std::osyncstream(std::cout) << std::format("[CPU {}] Thread affinity set successfully\n", ctx->processor_id);
     }
 
     // Allocate receive contexts
@@ -67,7 +69,7 @@ void worker_thread_func(worker_context* ctx) {
         }
     }
 
-    std::osyncstream(std::cout) << std::format("[CPU {}] Worker started, {} outstanding receives\n", 
+    if (g_verbose.load()) std::osyncstream(std::cout) << std::format("[CPU {}] Worker started, {} outstanding receives\n", 
                                                ctx->processor_id, OUTSTANDING_OPS);
 
     // Short helper lambdas to make the completion-processing loop clearer.
@@ -114,6 +116,10 @@ void worker_thread_func(worker_context* ctx) {
         if (!ex_result) {
             DWORD error = GetLastError();
             if (error == WAIT_TIMEOUT) {
+                continue;
+            }
+            if (error == ERROR_ABANDONED_WAIT_0) {
+                // IOCP was closed, time to exit
                 continue;
             }
             std::osyncstream(std::cerr) << std::format("[CPU {}] GetQueuedCompletionStatusEx failed with error: {}\n", ctx->processor_id, error);
@@ -170,7 +176,7 @@ void worker_thread_func(worker_context* ctx) {
         }
     }
 
-    std::osyncstream(std::cout) << std::format("[CPU {}] Worker shutting down. Stats: recv={}, sent={}, "
+    if (g_verbose.load()) std::osyncstream(std::cout) << std::format("[CPU {}] Worker shutting down. Stats: recv={}, sent={}, "
                                                "bytes_recv={}, bytes_sent={}\n",
                                                ctx->processor_id, 
                                                ctx->packets_received.load(),
@@ -185,11 +191,13 @@ void print_usage(const char* program_name) {
               << "  --port, -p <port>         - UDP port to listen on (required)\n"
               << "  --cores, -c <n>           - Number of cores to use (default: all available)\n"
               << "  --recvbuf, -b <bytes>     - Socket receive buffer size in bytes (default: 4194304 = 4MB)\n"
+              << "  --verbose, -v             - Enable verbose logging (default: minimal)\n"
               << "  --help, -h                - Show this help\n";
 }
 
 int main(int argc, char* argv[]) {
     ArgParser parser;
+    parser.add_option("verbose", 'v', "0", false);
     parser.add_option("port", 'p', "", true);
     parser.add_option("cores", 'c', "0", true);
     parser.add_option("recvbuf", 'b', "4194304", true);
@@ -204,6 +212,10 @@ int main(int argc, char* argv[]) {
     const std::string port_str = parser.get("port");
     const std::string cores_str = parser.get("cores");
     const std::string recvbuf_str = parser.get("recvbuf");
+    const std::string verbose_str = parser.get("verbose");
+    if (!verbose_str.empty() && verbose_str != "0") {
+        g_verbose.store(true);
+    }
 
     if (port_str.empty()) {
         std::cerr << "Port is required\n";
@@ -278,16 +290,16 @@ int main(int argc, char* argv[]) {
 
         // Try to set socket CPU affinity (best-effort)
         if (!set_socket_cpu_affinity(ctx->socket, static_cast<uint16_t>(cpu_id))) {
-            std::osyncstream(std::cerr) << std::format("Warning: Could not set CPU affinity for socket on CPU {}\n", cpu_id);
+            std::cerr << std::format("Warning: Could not set CPU affinity for socket on CPU {}\n", cpu_id);
         }
 
         // Increase socket buffers (best-effort)
         if (setsockopt(ctx->socket, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&recvbuf), sizeof(recvbuf)) != 0) {
-            std::osyncstream(std::cerr) << std::format("Warning: Could not set SO_RCVBUF to {} on CPU {}: {}\n", recvbuf, cpu_id, get_last_error_message());
+            std::cerr << std::format("Warning: Could not set SO_RCVBUF to {} on CPU {}: {}\n", recvbuf, cpu_id, get_last_error_message());
         }
         int sndbuf = recvbuf;
         if (setsockopt(ctx->socket, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&sndbuf), sizeof(sndbuf)) != 0) {
-            std::osyncstream(std::cerr) << std::format("Warning: Could not set SO_SNDBUF to {} on CPU {}: {}\n", sndbuf, cpu_id, get_last_error_message());
+            std::cerr << std::format("Warning: Could not set SO_SNDBUF to {} on CPU {}: {}\n", sndbuf, cpu_id, get_last_error_message());
         }
 
         // Bind socket to the requested port
@@ -324,7 +336,7 @@ int main(int argc, char* argv[]) {
             return nullptr;
         }
 
-        std::osyncstream(std::cout) << std::format("Created socket and IOCP for CPU {}\n", cpu_id);
+        if (g_verbose.load()) std::osyncstream(std::cout) << std::format("Created socket and IOCP for CPU {}\n", cpu_id);
         return ctx;
     };
 
@@ -382,10 +394,31 @@ int main(int argc, char* argv[]) {
 
     std::osyncstream(std::cout) << std::format("\nServer running on port {}. Press Ctrl+C to stop.\n\n", port);
 
-    // Wait for shutdown signal
+    // RPS printer thread: aggregate per-worker `packets_received` once per second
+    std::thread rps_thread([&workers]() {
+        uint64_t prev_total = 0;
+        while (!g_shutdown.load()) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+
+            uint64_t total_recv = 0;
+            for (const auto& ctx : workers) {
+                if (ctx) total_recv += ctx->packets_received.load(std::memory_order_relaxed);
+            }
+
+            uint64_t rps = (total_recv >= prev_total) ? (total_recv - prev_total) : 0;
+            prev_total = total_recv;
+
+            std::osyncstream(std::cout) << std::format("[RPS] {} req/s\n", rps);
+        }
+    });
+
+    // Wait for shutdown signal (main thread sleeps while RPS thread runs)
     while (!g_shutdown.load()) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
+
+    // Join the RPS thread so it exits cleanly before we teardown workers
+    if (rps_thread.joinable()) rps_thread.join();
 
     std::osyncstream(std::cout) << "\nShutting down...\n";
 

@@ -21,6 +21,8 @@
 
 // Global flag for shutdown
 std::atomic<bool> g_shutdown{false};
+// Global verbose flag
+std::atomic<bool> g_verbose{false};
 
 // Signal handler
 void signal_handler(int) {
@@ -79,7 +81,7 @@ void worker_thread_func(worker_context* ctx, size_t payload_size) {
     if (!set_thread_affinity(ctx->processor_id)) {
         std::osyncstream(std::cerr) << std::format("[CPU {}] Failed to set thread affinity\n", ctx->processor_id);
     } else {
-        std::osyncstream(std::cout) << std::format("[CPU {}] Thread affinity set successfully\n", ctx->processor_id);
+        if (g_verbose.load()) std::osyncstream(std::cout) << std::format("[CPU {}] Thread affinity set successfully\n", ctx->processor_id);
     }
 
     // Allocate IO contexts
@@ -113,7 +115,7 @@ void worker_thread_func(worker_context* ctx, size_t payload_size) {
         }
     }
 
-    std::osyncstream(std::cout) << std::format("[CPU {}] Worker started\n", ctx->processor_id);
+    if (g_verbose.load()) std::osyncstream(std::cout) << std::format("[CPU {}] Worker started\n", ctx->processor_id);
 
     // Rate limiting: each worker maintains a quota = elapsed_time * per_worker_rate
     auto start_time = std::chrono::steady_clock::now();
@@ -184,6 +186,11 @@ void worker_thread_func(worker_context* ctx, size_t payload_size) {
             if (error == WAIT_TIMEOUT) {
                 continue;
             }
+            if (error == ERROR_INVALID_HANDLE || error == ERROR_ABANDONED_WAIT_0) {
+                // IOCP was closed, time to exit
+                continue;
+            }
+
             std::osyncstream(std::cerr) << std::format("[Worker {}] GetQueuedCompletionStatusEx failed with error: {}\n", ctx->processor_id, error);
             // On other errors just continue the loop
             continue;
@@ -231,7 +238,7 @@ void worker_thread_func(worker_context* ctx, size_t payload_size) {
     // Count remaining outstanding as dropped (add to any already tracked as dropped)
     ctx->packets_dropped.fetch_add(ctx->outstanding_sequences.size());
 
-    std::osyncstream(std::cout) << std::format("[CPU {}] Worker shutting down. Stats: sent={}, recv={}, "
+    if (g_verbose.load()) std::osyncstream(std::cout) << std::format("[CPU {}] Worker shutting down. Stats: sent={}, recv={}, "
                                                "dropped={}\n",
                                                ctx->processor_id, 
                                                ctx->packets_sent.load(),
@@ -250,12 +257,14 @@ void print_usage(const char* program_name) {
               << "  --rate, -r <pps>          - Packets per second total across all workers (0 = unlimited)\n"
               << "  --recvbuf, -b <bytes>     - Socket receive buffer size in bytes (default: 4194304 = 4MB)\n"
               << "  --sockets, -k <n>         - Number of sockets to create per worker (default: 1)\n"
+              << "  --verbose, -v             - Enable verbose logging (default: minimal)\n"
               << "  --help, -h                - Show this help\n";
 }
 
 int main(int argc, char* argv[]) {
     // Use ArgParser for command-line parsing
     ArgParser parser;
+    parser.add_option("verbose", 'v', "0", false);
     parser.add_option("server", 's', "", true);
     parser.add_option("port", 'p', "", true);
     parser.add_option("payload", 'l', "64", true);
@@ -281,6 +290,10 @@ int main(int argc, char* argv[]) {
     const std::string rate_str = parser.get("rate");
     const std::string recvbuf_str = parser.get("recvbuf");
     const std::string sockets_str = parser.get("sockets");
+    const std::string verbose_str = parser.get("verbose");
+    if (!verbose_str.empty() && verbose_str != "0") {
+        g_verbose.store(true);
+    }
 
     if (server_str.empty() || port_arg.empty()) {
         std::cerr << "Server and port are required\n";
@@ -322,6 +335,7 @@ int main(int argc, char* argv[]) {
         long v = std::strtol(recvbuf_str.c_str(), nullptr, 10);
         if (v > 0) recvbuf = static_cast<int>(v);
     }
+    uint64_t per_worker_display = g_rate_limit == 0 ? 0 : (g_rate_limit / num_workers);
 
     std::cout << std::format("Scalable UDP Echo Client\n");
     std::cout << std::format("Server: {}:{}\n", server_ip, port);
@@ -329,7 +343,6 @@ int main(int argc, char* argv[]) {
     std::cout << std::format("Available processors: {}\n", num_processors);
     std::cout << std::format("Using {} worker(s)\n", num_workers);
     std::cout << std::format("Duration: {} seconds\n", duration_sec);
-    uint64_t per_worker_display = g_rate_limit == 0 ? 0 : (g_rate_limit / num_workers);
     std::cout << std::format("Rate limit: {} packets/sec total ({} per worker)\n", g_rate_limit, per_worker_display);
 
     // Initialize Winsock
@@ -467,7 +480,7 @@ int main(int argc, char* argv[]) {
                 } else if (local_addr.ss_family == AF_INET6) {
                     local_port = ntohs(reinterpret_cast<sockaddr_in6*>(&local_addr)->sin6_port);
                 }
-                std::cout << std::format("Socket for CPU {} sock {} bound to local port {}\n", i, idx, local_port);
+                if (g_verbose.load()) std::cout << std::format("Socket for CPU {} sock {} bound to local port {}\n", i, idx, local_port);
             } else {
                 std::cerr << std::format("Could not get local port for CPU {} sock {}: {}\n", i, idx, get_last_error_message());
             }
@@ -486,7 +499,7 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        std::cout << std::format("Created socket and IOCP for CPU {}\n", i);
+        if (g_verbose.load()) std::cout << std::format("Created socket and IOCP for CPU {}\n", i);
         workers.push_back(std::move(ctx));
     }
 
@@ -512,7 +525,7 @@ int main(int argc, char* argv[]) {
         ctx->worker_thread = std::thread(worker_thread_func, ctx.get(), payload_size);
     }
 
-    std::cout << std::format("\nClient running for {} seconds. Press Ctrl+C to stop early.\n\n", duration_sec);
+    if (g_verbose.load()) std::cout << std::format("\nClient running for {} seconds. Press Ctrl+C to stop early.\n\n", duration_sec);
 
     // Run for specified duration
     auto start_time = std::chrono::steady_clock::now();
