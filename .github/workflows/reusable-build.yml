@@ -18,6 +18,11 @@ on:
         required: false
         type: string
         default: Release
+      repository: # Default to this repository if not provided
+        required: false
+        type: string
+        default: alan-jowett/scalable_echo_server_demo
+      
 
 jobs:
   build:
@@ -26,6 +31,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          fetch-depth: 0
 
       - name: Configure CMake
         run: cmake -B ${{ inputs.build_dir }} -S . -DCMAKE_BUILD_TYPE=${{ inputs.config }}
