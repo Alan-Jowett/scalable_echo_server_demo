@@ -2,7 +2,7 @@
 # Copyright (c) 2025 scalable_echo_server_demo Contributors
 
 BasedOnStyle: Google
-IndentWidth: 2
+IndentWidth: 4
 ColumnLimit: 100
 AllowShortFunctionsOnASingleLine: Inline
 PointerAlignment: Left

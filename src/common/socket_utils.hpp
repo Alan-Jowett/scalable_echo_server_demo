@@ -30,8 +30,8 @@
 // Packet header for tracking sequence numbers
 #pragma pack(push, 1)
 struct packet_header {
-  uint64_t sequence_number;
-  uint64_t timestamp_ns;
+    uint64_t sequence_number;
+    uint64_t timestamp_ns;
 };
 #pragma pack(pop)
 
@@ -54,25 +54,25 @@ using unique_iocp = wil::unique_handle;
 
 // Define a custom exception for socket errors
 class socket_exception : public std::runtime_error {
- public:
-  explicit socket_exception(const std::string& message) : std::runtime_error(message) {}
+   public:
+    explicit socket_exception(const std::string& message) : std::runtime_error(message) {}
 };
 
 // Overlapped structure with additional context for IOCP
 struct io_context : OVERLAPPED {
-  io_operation_type operation;
-  WSABUF wsa_buf;
-  std::vector<char> buffer;
-  sockaddr_storage remote_addr;
-  int remote_addr_len;
+    io_operation_type operation;
+    WSABUF wsa_buf;
+    std::vector<char> buffer;
+    sockaddr_storage remote_addr;
+    int remote_addr_len;
 
-  io_context()
-      : OVERLAPPED{}, operation{io_operation_type::recv}, remote_addr_len{sizeof(remote_addr)} {
-    buffer.resize(MAX_PACKET_SIZE);
-    wsa_buf.buf = buffer.data();
-    wsa_buf.len = static_cast<ULONG>(buffer.size());
-    std::memset(&remote_addr, 0, sizeof(remote_addr));
-  }
+    io_context()
+        : OVERLAPPED{}, operation{io_operation_type::recv}, remote_addr_len{sizeof(remote_addr)} {
+        buffer.resize(MAX_PACKET_SIZE);
+        wsa_buf.buf = buffer.data();
+        wsa_buf.len = static_cast<ULONG>(buffer.size());
+        std::memset(&remote_addr, 0, sizeof(remote_addr));
+    }
 };
 
 // Initialize Winsock
