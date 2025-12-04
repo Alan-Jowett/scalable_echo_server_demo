@@ -439,6 +439,80 @@ void worker_thread_func_rio(server_rio_worker_context* ctx) try {
 }
 
 /**
+ * @brief Common template for RPS printer thread.
+ * 
+ * @tparam WorkerType IOCP or RIO worker context type
+ */
+template <typename WorkerType>
+std::thread create_rps_thread(const std::vector<std::unique_ptr<WorkerType>>& workers) {
+    return std::thread([&workers]() {
+        uint64_t prev_total = 0;
+        while (!g_shutdown.load()) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+
+            uint64_t total_recv = std::accumulate(
+                workers.begin(), workers.end(), 0ULL,
+                [](uint64_t sum, const std::unique_ptr<WorkerType>& ctx) {
+                    return sum + ctx->packets_received.load(std::memory_order_relaxed);
+                });
+
+            uint64_t rps = (total_recv >= prev_total) ? (total_recv - prev_total) : 0;
+            prev_total = total_recv;
+
+            std::osyncstream(std::cout) << std::format("[RPS] {} req/s\n", rps);
+        }
+    });
+}
+
+/**
+ * @brief Common template for printing final stats.
+ * 
+ * @tparam WorkerType IOCP or RIO worker context type
+ */
+template <typename WorkerType>
+void print_final_stats(const std::vector<std::unique_ptr<WorkerType>>& workers) {
+    uint64_t total_recv = 0, total_sent = 0, total_bytes_recv = 0, total_bytes_sent = 0;
+    for (const auto& ctx : workers) {
+        total_recv += ctx->packets_received.load();
+        total_sent += ctx->packets_sent.load();
+        total_bytes_recv += ctx->bytes_received.load();
+        total_bytes_sent += ctx->bytes_sent.load();
+    }
+
+    std::osyncstream(std::cout) << std::format("\nFinal Statistics:\n");
+    std::osyncstream(std::cout) << std::format("  Total packets received: {}\n", total_recv);
+    std::osyncstream(std::cout) << std::format("  Total packets sent: {}\n", total_sent);
+    std::osyncstream(std::cout)
+        << std::format("  Total bytes received: {}\n", total_bytes_recv);
+    std::osyncstream(std::cout) << std::format("  Total bytes sent: {}\n", total_bytes_sent);
+}
+
+/**
+ * @brief Common template for joining and cleanup of worker threads.
+ * 
+ * @tparam WorkerType IOCP or RIO worker context type
+ */
+template <typename WorkerType>
+void cleanup_workers(std::vector<std::unique_ptr<WorkerType>>& workers) {
+    for (auto& ctx : workers) {
+        if (ctx->worker_thread.joinable()) ctx->worker_thread.join();
+    }
+}
+
+/**
+ * @brief Close all IOCPs to wake up worker threads.
+ * Works for IOCP-based worker contexts only.
+ */
+template <typename WorkerType>
+void close_iocps(std::vector<std::unique_ptr<WorkerType>>& workers) {
+    for (auto& ctx : workers) {
+        if constexpr (requires { ctx->iocp; }) {
+            ctx->iocp.reset();
+        }
+    }
+}
+
+/**
  * @brief Print usage/help text to stdout.
  */
 void print_usage(const char* program_name) {
@@ -608,23 +682,7 @@ int main(int argc, char* argv[]) try {
             << std::format("\nServer running on port {} (RIO mode). Press Ctrl+C to stop.\n\n", port);
 
         // RPS printer thread
-        std::thread rps_thread([&rio_workers]() {
-            uint64_t prev_total = 0;
-            while (!g_shutdown.load()) {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-
-                uint64_t total_recv = std::accumulate(
-                    rio_workers.begin(), rio_workers.end(), 0ULL,
-                    [&](uint64_t sum, const std::unique_ptr<server_rio_worker_context>& ctx) {
-                        return sum + ctx->packets_received.load(std::memory_order_relaxed);
-                    });
-
-                uint64_t rps = (total_recv >= prev_total) ? (total_recv - prev_total) : 0;
-                prev_total = total_recv;
-
-                std::osyncstream(std::cout) << std::format("[RPS] {} req/s\n", rps);
-            }
-        });
+        std::thread rps_thread = create_rps_thread(rio_workers);
 
         // Optional timed shutdown
         std::thread duration_thread;
@@ -645,26 +703,9 @@ int main(int argc, char* argv[]) try {
 
         std::osyncstream(std::cout) << "\nShutting down...\n";
 
-        // Join worker threads
-        for (auto& ctx : rio_workers) {
-            if (ctx->worker_thread.joinable()) ctx->worker_thread.join();
-        }
-
-        // Print final stats
-        uint64_t total_recv = 0, total_sent = 0, total_bytes_recv = 0, total_bytes_sent = 0;
-        for (const auto& ctx : rio_workers) {
-            total_recv += ctx->packets_received.load();
-            total_sent += ctx->packets_sent.load();
-            total_bytes_recv += ctx->bytes_received.load();
-            total_bytes_sent += ctx->bytes_sent.load();
-        }
-
-        std::osyncstream(std::cout) << std::format("\nFinal Statistics:\n");
-        std::osyncstream(std::cout) << std::format("  Total packets received: {}\n", total_recv);
-        std::osyncstream(std::cout) << std::format("  Total packets sent: {}\n", total_sent);
-        std::osyncstream(std::cout)
-            << std::format("  Total bytes received: {}\n", total_bytes_recv);
-        std::osyncstream(std::cout) << std::format("  Total bytes sent: {}\n", total_bytes_sent);
+        // Cleanup and print stats
+        cleanup_workers(rio_workers);
+        print_final_stats(rio_workers);
 
         cleanup_winsock();
         return 0;
@@ -712,47 +753,9 @@ int main(int argc, char* argv[]) try {
     }
 
     // Start worker threads
-    auto start_worker_threads = [&](std::vector<std::unique_ptr<server_worker_context>>& wks) {
-        for (auto& ctx : wks) {
-            ctx->worker_thread = std::jthread(worker_thread_func, ctx.get());
-        }
-    };
-
-    auto close_iocps = [&](const std::vector<std::unique_ptr<server_worker_context>>& wks) {
-        for (const auto& ctx : wks) {
-            ctx->iocp.reset();
-        }
-    };
-
-    auto join_and_cleanup_workers =
-        [&](const std::vector<std::unique_ptr<server_worker_context>>& wks) {
-            for (const auto& ctx : wks) {
-                if (ctx->worker_thread.joinable()) ctx->worker_thread.join();
-            }
-
-            for (const auto& ctx : wks) {
-                ctx->socket.reset();
-            }
-        };
-
-    auto print_final_stats = [&](const std::vector<std::unique_ptr<server_worker_context>>& wks) {
-        uint64_t total_recv = 0, total_sent = 0, total_bytes_recv = 0, total_bytes_sent = 0;
-        for (const auto& ctx : wks) {
-            total_recv += ctx->packets_received.load();
-            total_sent += ctx->packets_sent.load();
-            total_bytes_recv += ctx->bytes_received.load();
-            total_bytes_sent += ctx->bytes_sent.load();
-        }
-
-        std::osyncstream(std::cout) << std::format("\nFinal Statistics:\n");
-        std::osyncstream(std::cout) << std::format("  Total packets received: {}\n", total_recv);
-        std::osyncstream(std::cout) << std::format("  Total packets sent: {}\n", total_sent);
-        std::osyncstream(std::cout)
-            << std::format("  Total bytes received: {}\n", total_bytes_recv);
-        std::osyncstream(std::cout) << std::format("  Total bytes sent: {}\n", total_bytes_sent);
-    };
-
-    start_worker_threads(workers);
+    for (auto& ctx : workers) {
+        ctx->worker_thread = std::jthread(worker_thread_func, ctx.get());
+    }
 
     std::osyncstream(std::cout) << std::format(
         "\nServer running on port {}. Press Ctrl+C to stop.\n\n", port);
@@ -766,24 +769,8 @@ int main(int argc, char* argv[]) try {
         });
     }
 
-    // RPS printer thread: aggregate per-worker `packets_received` once per second
-    std::thread rps_thread([&workers]() {
-        uint64_t prev_total = 0;
-        while (!g_shutdown.load()) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-
-            uint64_t total_recv = std::accumulate(
-                workers.begin(), workers.end(), 0ULL,
-                [&](uint64_t sum, const std::unique_ptr<server_worker_context>& ctx) {
-                    return sum + ctx->packets_received.load(std::memory_order_relaxed);
-                });
-
-            uint64_t rps = (total_recv >= prev_total) ? (total_recv - prev_total) : 0;
-            prev_total = total_recv;
-
-            std::osyncstream(std::cout) << std::format("[RPS] {} req/s\n", rps);
-        }
-    });
+    // RPS printer thread
+    std::thread rps_thread = create_rps_thread(workers);
 
     // Wait for shutdown signal (main thread sleeps while RPS thread runs)
     while (!g_shutdown.load()) {
@@ -798,11 +785,9 @@ int main(int argc, char* argv[]) try {
 
     std::osyncstream(std::cout) << "\nShutting down...\n";
 
-    // Close IOCPs to wake up worker threads, then join and cleanup
+    // Close IOCPs to wake up worker threads, then cleanup and print stats
     close_iocps(workers);
-    join_and_cleanup_workers(workers);
-
-    // Print final stats and cleanup winsock
+    cleanup_workers(workers);
     print_final_stats(workers);
 
     cleanup_winsock();
