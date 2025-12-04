@@ -473,6 +473,26 @@ unique_rio_buffer register_rio_buffer(const RIO_EXTENSION_FUNCTION_TABLE& rio, v
 void post_rio_recv(const RIO_EXTENSION_FUNCTION_TABLE& rio, RIO_RQ rq, rio_context* ctx);
 
 /**
+ * @brief Post multiple RIO receive operations in batch.
+ *
+ * Submits multiple receive operations to the RIO request queue in a single call
+ * by building RIO_BUF arrays and passing them to RIOReceiveEx. This is more
+ * efficient than posting operations individually.
+ *
+ * Example usage:
+ * @code
+ * std::vector<rio_context*> recv_contexts = {...};
+ * post_rio_recv(rio_table, request_queue, recv_contexts);
+ * @endcode
+ *
+ * @param rio RIO function table.
+ * @param rq Request queue.
+ * @param contexts Vector of RIO contexts to post receives for.
+ * @throws socket_exception if the batch operation fails.
+ */
+void post_rio_recv(const RIO_EXTENSION_FUNCTION_TABLE& rio, RIO_RQ rq, const std::vector<rio_context*>& contexts);
+
+/**
  * @brief Post a RIO send operation.
  *
  * @param rio RIO function table.
@@ -481,5 +501,29 @@ void post_rio_recv(const RIO_EXTENSION_FUNCTION_TABLE& rio, RIO_RQ rq, rio_conte
  * @param len Length of data to send.
  */
 void post_rio_send(const RIO_EXTENSION_FUNCTION_TABLE& rio, RIO_RQ rq, rio_context* ctx, DWORD length);
+
+/**
+ * @brief Post multiple RIO send operations in batch.
+ *
+ * Submits multiple send operations to the RIO request queue in a single call
+ * by building RIO_BUF arrays and passing them to RIOSendEx. This is more
+ * efficient than posting operations individually.
+ *
+ * Example usage:
+ * @code
+ * std::vector<std::pair<rio_context*, DWORD>> send_ops = {
+ *     {ctx1, 100},  // Send 100 bytes from ctx1
+ *     {ctx2, 256},  // Send 256 bytes from ctx2
+ * };
+ * post_rio_send(rio_table, request_queue, send_ops);
+ * @endcode
+ *
+ * @param rio RIO function table.
+ * @param rq Request queue.
+ * @param send_data Vector of pairs containing rio_context pointer and data length.
+ * @throws socket_exception if the batch operation fails.
+ */
+void post_rio_send(const RIO_EXTENSION_FUNCTION_TABLE& rio, RIO_RQ rq, 
+                   const std::vector<std::pair<rio_context*, DWORD>>& send_data);
 
 //@}

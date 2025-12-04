@@ -311,9 +311,14 @@ void worker_thread_func_rio(server_rio_worker_context* ctx) try {
                    std::back_inserter(available_send_contexts),
                    [](const std::unique_ptr<rio_context>& ptr) { return ptr.get(); });
 
-    // Post initial receive operations
-    for (auto& recv_ctx : recv_contexts) {
-        post_rio_recv(ctx->rio, ctx->request_queue.get(), recv_ctx.get());
+    // Post initial receive operations in batch
+    {
+        std::vector<rio_context*> initial_recvs;
+        initial_recvs.reserve(recv_contexts.size());
+        for (auto& recv_ctx : recv_contexts) {
+            initial_recvs.push_back(recv_ctx.get());
+        }
+        post_rio_recv(ctx->rio, ctx->request_queue.get(), initial_recvs);
     }
 
     if (g_verbose.load())
@@ -323,6 +328,10 @@ void worker_thread_func_rio(server_rio_worker_context* ctx) try {
 
     // Completion results array
     RIORESULT results[RIO_MAX_RESULTS];
+    std::vector<rio_context*> recv_repost;
+    std::vector<std::pair<rio_context*, DWORD>> send_batch;
+    recv_repost.reserve(RIO_MAX_RESULTS);
+    send_batch.reserve(RIO_MAX_RESULTS);
 
     while (!g_shutdown.load()) {
         // Continuously dequeue all available completions in a tight loop
@@ -340,6 +349,9 @@ void worker_thread_func_rio(server_rio_worker_context* ctx) try {
 
         // Process all completions in this batch
         do {
+            // Collect sends and receives to batch-submit them
+            recv_repost.clear();
+            send_batch.clear();
 
             // Process all completions in this batch
             for (ULONG i = 0; i < num_results; ++i) {
@@ -366,7 +378,7 @@ void worker_thread_func_rio(server_rio_worker_context* ctx) try {
                                     "[CPU {}] sync send failed: {}\n", ctx->processor_id, ex.what());
                             }
                             // Re-post receive and continue
-                            post_rio_recv(ctx->rio, ctx->request_queue.get(), rio_ctx);
+                            recv_repost.push_back(rio_ctx);
                             continue;
                         }
 
@@ -379,7 +391,7 @@ void worker_thread_func_rio(server_rio_worker_context* ctx) try {
                             std::osyncstream(std::cerr) << std::format(
                                 "[CPU {}] No available RIO send context\n", ctx->processor_id);
                             // Re-post receive and continue
-                            post_rio_recv(ctx->rio, ctx->request_queue.get(), rio_ctx);
+                            recv_repost.push_back(rio_ctx);
                             continue;
                         }
 
@@ -389,17 +401,25 @@ void worker_thread_func_rio(server_rio_worker_context* ctx) try {
                                     sizeof(rio_ctx->remote_addr));
                         send_ctx->remote_addr_len = rio_ctx->remote_addr_len;
 
-                        post_rio_send(ctx->rio, ctx->request_queue.get(), send_ctx, bytes_transferred);
+                        send_batch.emplace_back(send_ctx, bytes_transferred);
                         ctx->packets_sent.fetch_add(1);
                         ctx->bytes_sent.fetch_add(bytes_transferred);
                     }
 
                     // Re-post receive for continuous processing
-                    post_rio_recv(ctx->rio, ctx->request_queue.get(), rio_ctx);
+                    recv_repost.push_back(rio_ctx);
                 } else {
                     // Send completed — return context to pool
                     available_send_contexts.push_back(rio_ctx);
                 }
+            }
+
+            // Batch-submit all collected sends and receives
+            if (!send_batch.empty()) {
+                post_rio_send(ctx->rio, ctx->request_queue.get(), send_batch);
+            }
+            if (!recv_repost.empty()) {
+                post_rio_recv(ctx->rio, ctx->request_queue.get(), recv_repost);
             }
 
             // Try to dequeue more completions immediately
