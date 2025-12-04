@@ -590,3 +590,73 @@ void post_rio_send(const RIO_EXTENSION_FUNCTION_TABLE& rio, RIO_RQ rq, rio_conte
             std::format("RIOSendEx failed: {}", get_last_error_message()));
     }
 }
+
+/**
+ * @brief Post multiple RIO receive operations in batch.
+ *
+ * Posts multiple receive operations efficiently by calling RIOReceiveEx
+ * for each context. While RIO doesn't support true array submission for
+ * receives with different request contexts, batching them together
+ * reduces context switching and improves CPU cache locality.
+ *
+ * @param rio RIO function table.
+ * @param rq Request queue.
+ * @param contexts Vector of RIO contexts to post receives for.
+ * @throws socket_exception if any operation fails.
+ */
+void post_rio_recv(const RIO_EXTENSION_FUNCTION_TABLE& rio, RIO_RQ rq, const std::vector<rio_context*>& contexts) {
+    for (auto* ctx : contexts) {
+        ctx->operation = io_operation_type::recv;
+        ctx->remote_addr_len = sizeof(ctx->remote_addr);
+
+        RIO_BUF data_buf = {};
+        data_buf.BufferId = ctx->buffer_id.get();
+        data_buf.Offset = 0;
+        data_buf.Length = static_cast<ULONG>(ctx->buffer.size());
+
+        RIO_BUF addr_buf = {};
+        addr_buf.BufferId = ctx->addr_buffer_id.get();
+        addr_buf.Offset = 0;
+        addr_buf.Length = sizeof(ctx->remote_addr);
+
+        if (!rio.RIOReceiveEx(rq, &data_buf, 1, nullptr, &addr_buf, nullptr, nullptr, 0, ctx)) {
+            throw socket_exception(
+                std::format("RIOReceiveEx failed: {}", get_last_error_message()));
+        }
+    }
+}
+
+/**
+ * @brief Post multiple RIO send operations in batch.
+ *
+ * Posts multiple send operations efficiently by calling RIOSendEx
+ * for each context. While RIO doesn't support true array submission for
+ * sends with different request contexts, batching them together
+ * reduces context switching and improves CPU cache locality.
+ *
+ * @param rio RIO function table.
+ * @param rq Request queue.
+ * @param send_data Vector of pairs containing rio_context pointer and data length.
+ * @throws socket_exception if any operation fails.
+ */
+void post_rio_send(const RIO_EXTENSION_FUNCTION_TABLE& rio, RIO_RQ rq, 
+                   const std::vector<std::pair<rio_context*, DWORD>>& send_data) {
+    for (const auto& [ctx, length] : send_data) {
+        ctx->operation = io_operation_type::send;
+
+        RIO_BUF data_buf = {};
+        data_buf.BufferId = ctx->buffer_id.get();
+        data_buf.Offset = 0;
+        data_buf.Length = length;
+
+        RIO_BUF addr_buf = {};
+        addr_buf.BufferId = ctx->addr_buffer_id.get();
+        addr_buf.Offset = 0;
+        addr_buf.Length = ctx->remote_addr_len;
+
+        if (!rio.RIOSendEx(rq, &data_buf, 1, nullptr, &addr_buf, nullptr, nullptr, 0, ctx)) {
+            throw socket_exception(
+                std::format("RIOSendEx failed: {}", get_last_error_message()));
+        }
+    }
+}
