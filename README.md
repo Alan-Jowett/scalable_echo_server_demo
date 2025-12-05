@@ -220,3 +220,22 @@ echo_client --server 127.0.0.1 --port 5000 --rate 100000 --cc bbr --duration 30
 ```
 
 The available controllers are also listed in the client's `--help` output.
+
+## Developer Notes: Documentation and Doxygen
+
+- The congestion controller implementations live under `src/common` and are
+   documented with Doxygen-style comments to aid automated API documentation.
+   Key files:
+   - `src/common/null_cc.hpp` - no-op controller (placeholder / tests)
+   - `src/common/bbr.hpp` - lightweight BBR-like experimental controller
+   - `src/common/reno.hpp` - simple Reno-like windowed controller
+
+- To generate HTML documentation with Doxygen (if you have Doxygen installed):
+
+```powershell
+doxygen Doxyfile
+```
+
+- The Doxygen comments are intentionally concise; please open the header
+   files in `src/common` for per-method and member documentation used by the
+   generated docs.
