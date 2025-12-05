@@ -96,7 +96,7 @@ struct client_worker_context {
     std::unique_ptr<TDigest> current_pacing_tdigest;
     // Last send timestamp (ns) used to compute inter-packet interval
     uint64_t last_send_timestamp_ns{0};
-    std::unique_ptr<client_send_pacer> pacer;
+    std::unique_ptr<client_send_pacer_base> pacer;
 };
 
 std::mutex g_worker_contexts_mutex;
@@ -399,17 +399,20 @@ void worker_thread_func(client_worker_context* ctx, size_t payload_size) try {
                 ctx->packets_received.fetch_add(1);
                 ctx->bytes_received.fetch_add(bytes_transferred);
 
-                if (bytes_transferred >= HEADER_SIZE) {
-                    packet_header* header = reinterpret_cast<packet_header*>(io_ctx->buffer.data());
-                    uint64_t recv_time = get_timestamp_ns();
-                    uint64_t rtt = recv_time - header->timestamp_ns;
+                    if (bytes_transferred >= HEADER_SIZE) {
+                        packet_header* header = reinterpret_cast<packet_header*>(io_ctx->buffer.data());
+                        uint64_t recv_time = get_timestamp_ns();
+                        uint64_t rtt = recv_time - header->timestamp_ns;
 
-                    ctx->total_rtt_ns.fetch_add(rtt);
-                    update_min(ctx->min_rtt_ns, rtt);
-                    update_max(ctx->max_rtt_ns, rtt);
-                    // Rotate approximately once a second based on rate.
-                    post_rtt(ctx->curren_rtt_tdigest, ctx->per_worker_rate, rtt);
-                    ctx->outstanding_sequences.erase(header->sequence_number);
+                        ctx->total_rtt_ns.fetch_add(rtt);
+                        update_min(ctx->min_rtt_ns, rtt);
+                        update_max(ctx->max_rtt_ns, rtt);
+                        // Rotate approximately once a second based on rate.
+                        post_rtt(ctx->curren_rtt_tdigest, ctx->per_worker_rate, rtt);
+                        ctx->outstanding_sequences.erase(header->sequence_number);
+                        // Feed acknowledgement into pacer congestion controller so it can
+                        // update bandwidth/RTT estimates. Provide sequence number from header.
+                        if (ctx->pacer) ctx->pacer->on_ack(recv_time, header->sequence_number, rtt);
                 }
 
                 // Re-post receive on the socket that completed
@@ -483,6 +486,7 @@ int main(int argc, char* argv[]) try {
     parser.add_option("duration", 'd', "10", true, "Test duration in seconds (default: 10)");
     parser.add_option("rate", 'r', "10000", true,
                       "Total packet rate limit (packets/sec, 0=unlimited)");
+    parser.add_option("cc", 'C', "null", true, "Congestion controller to use: null|bbr (default: null)");
     parser.add_option("recvbuf", 'b', "4194304", true,
                       "Socket receive buffer size in bytes (default: 4194304)");
     parser.add_option("sockets", 'k', "16", true, "Number of sockets per worker (default: 16)");
@@ -504,6 +508,7 @@ int main(int argc, char* argv[]) try {
     const std::string rate_str = parser.get("rate");
     const std::string recvbuf_str = parser.get("recvbuf");
     const std::string sockets_str = parser.get("sockets");
+    const std::string cc_choice = parser.get("cc");
     const std::string stats_file = parser.get("stats-file");
     const std::string verbose_str = parser.get("verbose");
     size_t payload_size = 0;
@@ -561,6 +566,7 @@ int main(int argc, char* argv[]) try {
     std::cout << std::format("Duration: {} seconds\n", duration_sec);
     std::cout << std::format("Rate limit: {} packets/sec total ({} per worker)\n", g_rate_limit,
                              per_worker_display);
+    std::cout << std::format("Congestion controller: {}\n", cc_choice.empty() ? "null" : cc_choice);
 
     // Initialize Winsock
     initialize_winsock();
@@ -704,7 +710,12 @@ int main(int argc, char* argv[]) try {
     // Start worker threads
     for (auto& ctx : workers) {
         // create per-worker pacer now so it doesn't accumulate tokens before start
-        ctx->pacer = std::make_unique<client_send_pacer>(static_cast<double>(ctx->per_worker_rate));
+        if (cc_choice == "bbr") {
+            ctx->pacer = std::make_unique<client_send_pacer<bbr_congestion_controller>>(static_cast<double>(ctx->per_worker_rate));
+        } else {
+            // default: null controller (allow requested rate)
+            ctx->pacer = std::make_unique<client_send_pacer<>>(static_cast<double>(ctx->per_worker_rate));
+        }
         ctx->worker_thread = std::thread(worker_thread_func, ctx.get(), payload_size);
     }
 

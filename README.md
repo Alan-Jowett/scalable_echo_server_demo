@@ -198,3 +198,21 @@ Choose based on your workload and goals:
 Recommendation: keep the default overlapped IO for production and high-throughput testing. Use
 `--sync-reply` for small experiments, micro-benchmarks, or when you explicitly want the simpler
 blocking send path for diagnosis.
+
+## Congestion Control (client)
+
+The client supports selectable congestion-control policies via the `--cc` option.
+
+- `--cc null` (default): No congestion controller — the client will attempt to send at the
+   exact rate specified by `--rate` (subject to OS and NIC limits).
+- `--cc bbr`: A lightweight BBR-style controller that estimates bandwidth and minimum RTT and
+   adjusts a target pacing rate to achieve high throughput while attempting to avoid excessive RTT
+   inflation. This is experimental and provided for evaluation.
+
+Example:
+
+```bash
+echo_client --server 127.0.0.1 --port 5000 --rate 100000 --cc bbr --duration 30
+```
+
+The available controllers are also listed in the client's `--help` output.

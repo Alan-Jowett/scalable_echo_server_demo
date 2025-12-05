@@ -193,6 +193,8 @@ class ArgParser {
             }
             std::cout << "\n";
         }
+        // Add custom help note for congestion controllers available
+        std::cout << "\nAvailable congestion controllers: null, bbr\n";
     }
 
     /**

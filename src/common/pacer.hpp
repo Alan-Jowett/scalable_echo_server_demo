@@ -15,26 +15,50 @@
 #include <cstdint>
 #include <algorithm>
 #include <chrono>
+#include "null_cc.hpp"
+// bbr.hpp remains available to include by callers if desired
+#include "bbr.hpp"
+
+/**
+ * @brief Abstract base for client send pacer. Provides a stable polymorphic
+ * interface so different templated pacer implementations can be stored
+ * behind a single pointer type.
+ */
+class client_send_pacer_base {
+public:
+    virtual ~client_send_pacer_base() = default;
+    virtual bool can_send() = 0;
+    virtual void record_send() = 0;
+    virtual void poll() = 0;
+    virtual uint64_t get_next_send_time_ns() const = 0;
+    virtual void reset_to_now() = 0;
+    virtual void on_ack(uint64_t now_ns, uint64_t seq, uint64_t rtt_ns) = 0;
+    virtual double get_target_rate_pps() const = 0;
+};
 
 /**
  * @brief Client send pacer using token bucket algorithm.
  * @note: Not thread-safe; caller must ensure synchronization if used from multiple threads.
  */
-class client_send_pacer {
+template <class CongestionController = null_congestion_controller>
+class client_send_pacer : public client_send_pacer_base {
 public:
     /**
      * @brief Construct a new client send pacer object.
      * 
      * @param[in] pps The target packet rate in packets per second (0 = unlimited).
      */
-    explicit client_send_pacer(double pps)
-        : rate_pps_(pps),
-          unlimited_(pps == 0.0),
-          // Allow a small burst window (fraction of a second) to tolerate
-          // scheduling jitter. Default burst window = 0.005s (5 ms).
-          capacity_((std::max)(1.0, pps * 0.005)),
+        explicit client_send_pacer(double pps)
+                : rate_pps_(pps),
+                    unlimited_(pps == 0.0),
+                    // Allow a small burst window (fraction of a second) to tolerate
+                    // scheduling jitter. Default burst window = 0.005s (5 ms).
+                    capacity_((std::max)(1.0, pps * 0.005)),
                     tokens_(0.0),
-          last_refill_ns_(now_ns()) {}
+                    last_refill_ns_(now_ns()) {
+                // Initialize congestion controller with initial rate
+                cc_.set_initial_rate(pps);
+        }
 
     ~client_send_pacer() = default;
 
@@ -47,8 +71,15 @@ public:
      * @return true A packet may be sent immediately.
      * @return false A packet must be delayed to satisfy the rate.
      */
-    bool can_send() {
+    bool can_send() override {
         if (unlimited_) return true;
+        // Allow congestion controller to influence effective rate
+        double target = cc_.target_rate_pps();
+        if (target > 0.0 && target != rate_pps_) {
+            rate_pps_ = target;
+            // recompute capacity when rate changes
+            capacity_ = (std::max)(1.0, rate_pps_ * 0.005);
+        }
         uint64_t now = now_ns();
         refill(now);
         return tokens_ >= 1.0 - 1e-12;
@@ -60,21 +91,24 @@ public:
      * Decrements the token count; if called when tokens are unavailable, a
      * bounded negative debt is permitted to represent transient overshoot.
      */
-    void record_send() {
+    void record_send() override {
         if (unlimited_) return;
         uint64_t now = now_ns();
         refill(now);
         // consume one token; do not allow negative debt
         tokens_ = (std::max)(0.0, tokens_ - 1.0);
+        // inform congestion controller about the send (no sequence here)
+        cc_.on_send(now, last_sequence_++);
     }
 
     /**
      * @brief Perform periodic polling to update internal state.
      */
-    void poll() {
+    void poll() override {
         if (unlimited_) return;
         uint64_t now = now_ns();
         refill(now);
+        cc_.on_poll(now);
     }
 
     /**
@@ -85,7 +119,7 @@ public:
      *
      * @return uint64_t wait time in nanoseconds (0 == send now)
      */
-    uint64_t get_next_send_time_ns() const {
+    uint64_t get_next_send_time_ns() const override {
         if (unlimited_) return 0;
         uint64_t now = now_ns();
         // compute tokens as if we refilled now (without mutating state)
@@ -114,6 +148,13 @@ public:
         last_refill_ns_ = now;
     }
 
+    // Let caller pass RTT/ack info to congestion controller
+    void on_ack(uint64_t now_ns, uint64_t seq, uint64_t rtt_ns) override {
+        if (unlimited_) return;
+        cc_.on_ack(now_ns, seq, rtt_ns);
+    }
+    double get_target_rate_pps() const override { return cc_.target_rate_pps(); }
+
 private:
     static uint64_t now_ns() {
         return static_cast<uint64_t>(
@@ -135,4 +176,8 @@ private:
     double capacity_{1.0};
     double tokens_{0.0};
     uint64_t last_refill_ns_{0};
+    // simple send sequence counter used for CC bookkeeping when no external
+    // sequence is provided by the caller.
+    uint64_t last_sequence_{1};
+    CongestionController cc_;
 };
