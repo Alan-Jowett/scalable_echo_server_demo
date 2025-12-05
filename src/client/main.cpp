@@ -712,6 +712,8 @@ int main(int argc, char* argv[]) try {
         // create per-worker pacer now so it doesn't accumulate tokens before start
         if (cc_choice == "bbr") {
             ctx->pacer = std::make_unique<client_send_pacer<bbr_congestion_controller>>(static_cast<double>(ctx->per_worker_rate));
+        } else if (cc_choice == "reno") {
+            ctx->pacer = std::make_unique<client_send_pacer<reno_congestion_controller>>(static_cast<double>(ctx->per_worker_rate));
         } else {
             // default: null controller (allow requested rate)
             ctx->pacer = std::make_unique<client_send_pacer<>>(static_cast<double>(ctx->per_worker_rate));

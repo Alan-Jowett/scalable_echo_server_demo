@@ -209,6 +209,10 @@ The client supports selectable congestion-control policies via the `--cc` option
    adjusts a target pacing rate to achieve high throughput while attempting to avoid excessive RTT
    inflation. This is experimental and provided for evaluation.
 
+- `--cc reno`: A simple Reno-like controller (window-based). It maintains a congestion window
+   in packets and computes a pacing rate as cwnd / min_rtt. This is an experimental, classic
+   TCP-style controller provided for comparison.
+
 Example:
 
 ```bash
